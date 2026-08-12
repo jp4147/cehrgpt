@@ -26,3 +26,42 @@ build/
 test_data
 test_dataset_prepared
 test*results
+
+# --- Python / environment ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# --- IDE ---
+.vscode/
+.idea/
+
+# --- Training artifacts / checkpoints ---
+checkpoints/
+runs/
+wandb/
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+
+# --- Datasets, caches, features (never commit patient data) ---
+*.parquet
+*.arrow
+*.csv
+data/
+cache/
+prepared_ds/
+features/
+features_with_label/
+output/
+outputs/
+*.pkl
+*.pickle
+
+# --- HuggingFace / datasets library cache ---
+.cache/
+*.lock
