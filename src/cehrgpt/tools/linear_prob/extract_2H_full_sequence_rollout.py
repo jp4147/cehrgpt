@@ -168,7 +168,7 @@ def main():
 
     data_collator = CehrGptDataCollator(
         tokenizer=tokenizer,
-        max_length=model_args.max_position_embeddings,
+        max_length=model.config.max_position_embeddings,
         include_values=model.config.include_values,
         pretraining=False,
         include_ttv_prediction=False,
