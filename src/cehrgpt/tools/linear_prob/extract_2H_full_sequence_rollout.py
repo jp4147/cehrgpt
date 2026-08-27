@@ -18,6 +18,15 @@ single patient at a time rather than per_device_eval_batch_size patients.
 Everything else (tokenization/truncation via the cached prepared dataset,
 value encoding, combine_global_local_features fallback/gating) is identical
 to extract_pooled_and_full_sequence.py.
+
+--capture_attentions (default off): when omitted, output_attentions is never
+requested and full_sequence_attentions/ is never written -- only pooled
+features and full_sequence_features/ get produced, same cost as before this
+flag existed. Pass --capture_attentions to additionally capture and save
+per-layer attention weights, at the extra memory/time cost described above.
+Intended usage: a fast pass over the full cohort without this flag, and a
+separate, restricted pass (via --person_ids_file) with this flag on for just
+the patients that actually need rollout analysis.
 """
 
 import sys
@@ -71,6 +80,16 @@ def _pop_person_ids_file_arg():
     return person_ids_file
 
 
+def _pop_flag_arg(flag_name: str) -> bool:
+    """Strip a bare boolean flag (e.g. --capture_attentions) out of sys.argv
+    before parse_runner_args() sees it, for the same reason as
+    _pop_person_ids_file_arg -- it isn't a field on any of the dataclasses
+    parse_runner_args() knows about."""
+    found = flag_name in sys.argv
+    sys.argv = [a for a in sys.argv if a != flag_name]
+    return found
+
+
 def load_person_id_filter(person_ids_file: str) -> set:
     path = Path(person_ids_file)
     if path.suffix == ".parquet":
@@ -95,7 +114,10 @@ def load_person_id_filter(person_ids_file: str) -> set:
 
 def main():
     person_ids_file = _pop_person_ids_file_arg()
+    capture_attentions = _pop_flag_arg("--capture_attentions")
     cehrgpt_args, data_args, model_args, training_args = parse_runner_args()
+
+    LOG.info("capture_attentions: %s", capture_attentions)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch_dtype = get_torch_dtype(model_args.torch_dtype)
@@ -201,10 +223,13 @@ def main():
 
         split_pooled_dir = pooled_root / f"{split}_features"
         split_seq_dir = full_seq_root / split
-        split_attn_dir = full_attn_root / split
         split_pooled_dir.mkdir(parents=True, exist_ok=True)
         split_seq_dir.mkdir(parents=True, exist_ok=True)
-        split_attn_dir.mkdir(parents=True, exist_ok=True)
+        if capture_attentions:
+            split_attn_dir = full_attn_root / split
+            split_attn_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            split_attn_dir = None
 
         with torch.no_grad():
             for batch in tqdm(loader, desc=f"Extracting ({split})"):
@@ -214,7 +239,7 @@ def main():
                     batch.pop(key, None)
 
                 batch = {k: v.to(device) for k, v in batch.items()}
-                out = model(**batch, output_attentions=True, output_hidden_states=True)
+                out = model(**batch, output_attentions=capture_attentions, output_hidden_states=True)
 
                 # batch_size=1, no padding introduced (nothing else in the
                 # batch to pad against) -- the whole row is this one
@@ -234,16 +259,6 @@ def main():
                 else:
                     feat = local_vec.numpy()
 
-                # (num_layers, seq_len, seq_len): average over heads per
-                # layer, then stack layers. No slicing needed for the same
-                # reason as above -- the whole (seq_len, seq_len) matrix is
-                # this one patient's own attention, nothing to trim.
-                layer_matrices = [
-                    layer_attn[0].mean(dim=0).cpu().float().numpy()  # (num_heads, S, S) -> (S, S)
-                    for layer_attn in out.attentions
-                ]
-                attn_stack = np.stack(layer_matrices, axis=0)  # (num_layers, S, S)
-
                 subject_id = subject_ids[0]
                 label = labels[0]
 
@@ -254,11 +269,23 @@ def main():
                 }]).to_parquet(split_pooled_dir / f"{uuid.uuid4()}.parquet", index=False)
 
                 np.save(split_seq_dir / f"{subject_id}.npy", local_hidden.numpy())
-                np.save(split_attn_dir / f"{subject_id}.npy", attn_stack)
+
+                if capture_attentions:
+                    # (num_layers, seq_len, seq_len): average over heads per
+                    # layer, then stack layers. No slicing needed for the same
+                    # reason as above -- the whole (seq_len, seq_len) matrix is
+                    # this one patient's own attention, nothing to trim.
+                    layer_matrices = [
+                        layer_attn[0].mean(dim=0).cpu().float().numpy()  # (num_heads, S, S) -> (S, S)
+                        for layer_attn in out.attentions
+                    ]
+                    attn_stack = np.stack(layer_matrices, axis=0)  # (num_layers, S, S)
+                    np.save(split_attn_dir / f"{subject_id}.npy", attn_stack)
 
         LOG.info(
             "Finished split '%s' -- pooled: %s, full sequences: %s, attentions: %s",
-            split, split_pooled_dir, split_seq_dir, split_attn_dir,
+            split, split_pooled_dir, split_seq_dir,
+            split_attn_dir if capture_attentions else "skipped (--capture_attentions not set)",
         )
 
 
