@@ -51,7 +51,12 @@ def build_overrides(output_dir: str, prepared_dir: str, max_steps: int) -> Dict[
         "save_total_limit": 1,
         "streaming": False,
         "preprocessing_num_workers": 4,
+        # Single-process loading keeps the smoke test quick to start and easy to debug.
+        # prefetch_factor must be cleared alongside it: TrainingArguments rejects a
+        # prefetch_factor with num_workers=0, and both CoMET YAMLs legitimately set
+        # prefetch_factor: 8 for real multi-worker runs.
         "dataloader_num_workers": 0,
+        "dataloader_prefetch_factor": None,
     }
 
 
