@@ -49,6 +49,32 @@ from cehrgpt.models.gpt2 import GPT2MLP, LlamaMLP, _get_unpad_data
 logger = logging.get_logger("transformers")
 
 
+def build_sdpa_params(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+):
+    """
+    Construct `torch.backends.cuda.SDPAParams` across torch versions.
+
+    torch 2.4 takes six positional arguments; newer versions (verified on 2.8.0) append a
+    trailing `enable_gqa` flag. `enable_gqa=False` is always right here: key/value are
+    expanded with `repeat_kv` before reaching SDPA, so the kernel only ever sees as many
+    key/value heads as query heads, whatever `num_key_value_heads` is set to.
+    """
+    try:
+        return torch.backends.cuda.SDPAParams(
+            query, key, value, attn_mask, dropout_p, is_causal, False
+        )
+    except TypeError:
+        return torch.backends.cuda.SDPAParams(
+            query, key, value, attn_mask, dropout_p, is_causal
+        )
+
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotate half the hidden dims of the input (Llama/Qwen2 convention)."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -202,12 +228,18 @@ class Qwen2Attention(nn.Module):
             return
         Qwen2Attention._sdpa_backend_checked = True
         try:
-            params = torch.backends.cuda.SDPAParams(
-                query, key, value, attention_mask, 0.0, False
-            )
+            params = build_sdpa_params(query, key, value, attention_mask)
             efficient = torch.backends.cuda.can_use_efficient_attention(params, False)
             flash = torch.backends.cuda.can_use_flash_attention(params, False)
-        except Exception:  # noqa: BLE001 - introspection API differs across versions
+        except Exception as error:  # noqa: BLE001 - introspection differs across versions
+            # Do not fail silently: without this probe a math fallback is invisible.
+            logger.warning(
+                "Could not determine the SDPA backend (%s: %s). If training memory grows "
+                "with the square of the packed sequence length, PyTorch is falling back "
+                "to the math backend.",
+                type(error).__name__,
+                error,
+            )
             return
         if not (efficient or flash):
             capability = torch.cuda.get_device_capability(query.device)

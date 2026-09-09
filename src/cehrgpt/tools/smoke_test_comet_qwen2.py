@@ -60,6 +60,7 @@ def probe_sdpa_backend(dtype_name: str, packed_len: int) -> bool:
     import torch
 
     from cehrgpt.models.hf_cehrgpt import create_sample_packing_attention_mask
+    from cehrgpt.models.qwen2 import build_sdpa_params
 
     if not torch.cuda.is_available():
         print("  no CUDA device; skipping the SDPA backend probe")
@@ -89,7 +90,7 @@ def probe_sdpa_backend(dtype_name: str, packed_len: int) -> bool:
     query = torch.randn((1, 12, packed_len, 64), device=device, dtype=dtype)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
-    params = torch.backends.cuda.SDPAParams(query, key, value, mask, 0.0, False)
+    params = build_sdpa_params(query, key, value, mask)
     efficient = torch.backends.cuda.can_use_efficient_attention(params, False)
     flash = torch.backends.cuda.can_use_flash_attention(params, False)
     print(f"  can_use_efficient_attention={efficient} can_use_flash_attention={flash}")
