@@ -30,6 +30,63 @@ class CehrGPTArguments:
         default="GPT2MLP",
         metadata={"help": "The decoder MLP architecture"},
     )
+    backbone: Literal["gpt2", "qwen2"] = dataclasses.field(
+        default="gpt2",
+        metadata={
+            "help": "Which decoder stack to train. 'gpt2' is the original CEHR-GPT block "
+            "(LayerNorm, Conv1D projections, optional age-based rotary). 'qwen2' is the "
+            "Qwen2-style block (RMSNorm, Linear q/k/v/o projections, per-head rotary over "
+            "sequential positions)."
+        },
+    )
+    rms_norm_eps: Optional[float] = dataclasses.field(
+        default=1e-6,
+        metadata={"help": "Epsilon for the RMSNorm layers; only used by the qwen2 backbone"},
+    )
+    resid_pdrop: Optional[float] = dataclasses.field(
+        default=0.1,
+        metadata={
+            "help": "Dropout on the residual path (attention output and MLP output). "
+            "Applies to both backbones."
+        },
+    )
+    embd_pdrop: Optional[float] = dataclasses.field(
+        default=0.1,
+        metadata={"help": "Dropout on the embeddings. Applies to both backbones."},
+    )
+    attn_pdrop: Optional[float] = dataclasses.field(
+        default=0.1,
+        metadata={
+            "help": "Dropout on the attention probabilities. Applies to both backbones."
+        },
+    )
+    num_key_value_heads: Optional[int] = dataclasses.field(
+        default=None,
+        metadata={
+            "help": "Number of key/value heads for grouped-query attention. Defaults to "
+            "num_attention_heads, i.e. standard multi-head attention. Only used by the "
+            "qwen2 backbone."
+        },
+    )
+    rope_theta: Optional[float] = dataclasses.field(
+        default=10000.0,
+        metadata={
+            "help": "Base period of the rotary embeddings; only used by the qwen2 backbone"
+        },
+    )
+    # NOTE: deliberately not named `attn_implementation`; cehrbert's ModelArguments
+    # already defines that field and HfArgumentParser raises on duplicate field names
+    # across the dataclasses it parses together.
+    force_attn_implementation: Optional[
+        Literal["eager", "sdpa", "flash_attention_2"]
+    ] = dataclasses.field(
+        default=None,
+        metadata={
+            "help": "Force a specific attention implementation. When unset, the gpt2 "
+            "backbone uses flash attention 2 if available (else eager) and the qwen2 "
+            "backbone uses sdpa. 'sdpa' is only implemented for the qwen2 backbone."
+        },
+    )
     include_inpatient_hour_token: Optional[bool] = dataclasses.field(
         default=True,
         metadata={"help": "Include inpatient hour token"},
