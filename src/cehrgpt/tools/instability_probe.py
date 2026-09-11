@@ -54,20 +54,52 @@ class InstabilityProbe(TrainerCallback):
         every: int = 25,
         abort_on_nonfinite: bool = True,
         per_layer: bool = True,
+        residual_scale: bool = True,
     ):
         self.every = every
         self.abort_on_nonfinite = abort_on_nonfinite
         self.per_layer = per_layer
+        self.residual_scale = residual_scale
         self._model = None
         self._hook_handle = None
+        self._block_hooks = []
+        self._block_rms = {}
+        self._capture_rms = False
         self._step = 0
         self._should_stop = False
         self._clipped = not SUPPORTS_PRE_OPTIMIZER_STEP
+
+    def _install_block_hooks(self, model):
+        """
+        Record the RMS of the hidden states entering each decoder block.
+
+        RMSNorm's Jacobian scales as 1/rms, so a residual stream that grows over training
+        progressively shrinks the gradient reaching each block's weights. Block 0 is
+        immune - its input is the embedding, whose scale is pinned - which produces a
+        profile where L0 holds steady while deeper layers starve. Measuring the per-block
+        input scale alongside the per-block gradient tells you whether that is what is
+        happening, rather than leaving it as an inference from the gradient shape alone.
+        """
+        for index, block in enumerate(self._decoder_blocks(model)):
+
+            def hook(module, args, kwargs=None, _index=index):
+                if not self._capture_rms:
+                    return
+                hidden = args[0] if args else None
+                if isinstance(hidden, torch.Tensor):
+                    with torch.no_grad():
+                        self._block_rms[_index] = (
+                            hidden.detach().float().pow(2).mean().sqrt().item()
+                        )
+
+            self._block_hooks.append(block.register_forward_pre_hook(hook))
 
     # ---- lifecycle -------------------------------------------------------------
 
     def on_train_begin(self, args, state, control, model=None, optimizer=None, **kwargs):
         self._model = model
+        if self.residual_scale and model is not None:
+            self._install_block_hooks(model)
         if SUPPORTS_PRE_OPTIMIZER_STEP:
             LOG.info(
                 "InstabilityProbe active (pre-clip gradients, every %d steps)", self.every
@@ -114,9 +146,17 @@ class InstabilityProbe(TrainerCallback):
         if self._hook_handle is not None:
             self._hook_handle.remove()
             self._hook_handle = None
+        for handle in self._block_hooks:
+            handle.remove()
+        self._block_hooks = []
 
     def on_step_begin(self, args, state, control, **kwargs):
         self._step = state.global_step
+        # Only measure residual scale on steps that will be reported, so the hooks cost
+        # nothing on the other 24 out of 25 steps.
+        self._capture_rms = self.residual_scale and (
+            self.every > 0 and state.global_step % self.every == 0
+        )
 
     def on_step_end(self, args, state, control, **kwargs):
         # The fallback path cannot touch `control`, so honour the abort here.
@@ -184,13 +224,35 @@ class InstabilityProbe(TrainerCallback):
             return
 
         scope = "post-clip" if self._clipped else "pre-clip"
+        backbone = getattr(model, "cehrgpt", None)
+        blocks = self._decoder_blocks(model)
+
+        def grad_norm(parameters):
+            total = 0.0
+            for parameter in parameters:
+                if parameter.grad is not None:
+                    total += parameter.grad.detach().float().pow(2).sum().item()
+            return total**0.5
+
+        embedding = model.get_input_embeddings()
+        # The tied embedding / lm_head sits OUTSIDE every decoder block, so a per-layer
+        # breakdown alone cannot say whether growth lives there. Report its gradient, not
+        # just its weight norm.
+        embedding_grad = (
+            grad_norm([embedding.weight]) if embedding is not None else float("nan")
+        )
+        final_norm = getattr(backbone, "ln_f", None) if backbone else None
+        final_norm_grad = (
+            grad_norm([final_norm.weight]) if final_norm is not None else float("nan")
+        )
+        block_total = grad_norm(
+            [p for block in blocks for p in block.parameters()]
+        )
+
         with torch.no_grad():
-            embedding = model.get_input_embeddings()
             embedding_norm = (
                 embedding.weight.norm().item() if embedding is not None else float("nan")
             )
-            backbone = getattr(model, "cehrgpt", None)
-            final_norm = getattr(backbone, "ln_f", None) if backbone else None
             final_norm_value = (
                 final_norm.weight.norm().item()
                 if final_norm is not None
@@ -199,21 +261,30 @@ class InstabilityProbe(TrainerCallback):
 
         message = (
             f"InstabilityProbe step {step}: grad_norm[{scope}]={total_sq ** 0.5:.4f} "
-            f"embedding_norm={embedding_norm:.3f} final_norm_w={final_norm_value:.3f}"
+            f"blocks={block_total:.4f} embed_grad={embedding_grad:.4f} "
+            f"ln_f_grad={final_norm_grad:.4f} embedding_norm={embedding_norm:.3f} "
+            f"final_norm_w={final_norm_value:.3f}"
         )
 
-        if self.per_layer:
-            blocks = self._decoder_blocks(model)
-            if blocks:
-                per_layer = []
-                for index, block in enumerate(blocks):
-                    block_sq = sum(
-                        p.grad.detach().float().pow(2).sum().item()
-                        for p in block.parameters()
-                        if p.grad is not None
-                    )
-                    per_layer.append(f"L{index}={block_sq ** 0.5:.4f}")
-                message += " | " + " ".join(per_layer)
+        if self.per_layer and blocks:
+            per_layer = [
+                f"L{index}={grad_norm(list(block.parameters())):.4f}"
+                for index, block in enumerate(blocks)
+            ]
+            message += " | grad " + " ".join(per_layer)
+        if self.residual_scale and self._block_rms:
+            per_block_rms = [
+                f"L{index}={self._block_rms[index]:.3f}"
+                for index in sorted(self._block_rms)
+            ]
+            message += " | in_rms " + " ".join(per_block_rms)
+            # Gradient starvation from a growing residual stream shows up as the ratio
+            # between the last and first block's input scale drifting upward over
+            # training while the deep-layer gradients fall.
+            first = self._block_rms.get(0)
+            last = self._block_rms.get(max(self._block_rms))
+            if first and last:
+                message += f" (last/first={last / first:.2f})"
         LOG.info(message)
 
 
