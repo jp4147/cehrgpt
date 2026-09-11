@@ -230,6 +230,7 @@ def load_and_create_model(
             rms_norm_eps=cehrgpt_args.rms_norm_eps,
             num_key_value_heads=cehrgpt_args.num_key_value_heads,
             rope_theta=cehrgpt_args.rope_theta,
+            use_qk_norm=cehrgpt_args.use_qk_norm,
             resid_pdrop=cehrgpt_args.resid_pdrop,
             embd_pdrop=cehrgpt_args.embd_pdrop,
             attn_pdrop=cehrgpt_args.attn_pdrop,

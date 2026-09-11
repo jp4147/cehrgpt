@@ -87,6 +87,16 @@ class CehrGPTArguments:
             "help": "Base period of the rotary embeddings; only used by the qwen2 backbone"
         },
     )
+    use_qk_norm: Optional[bool] = dataclasses.field(
+        default=False,
+        metadata={
+            "help": "Apply RMSNorm to each head's query and key before the rotary "
+            "embedding (Qwen3's QK-norm). Qwen2 leaves the attention logit scale "
+            "unbounded, which destabilises from-scratch training. Adds parameters, so a "
+            "checkpoint trained with this cannot be reloaded without it. Only used by the "
+            "qwen2 backbone."
+        },
+    )
     # NOTE: deliberately not named `attn_implementation`; cehrbert's ModelArguments
     # already defines that field and HfArgumentParser raises on duplicate field names
     # across the dataclasses it parses together.

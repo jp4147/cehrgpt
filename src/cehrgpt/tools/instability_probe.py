@@ -64,6 +64,7 @@ class InstabilityProbe(TrainerCallback):
         self._hook_handle = None
         self._block_hooks = []
         self._block_rms = {}
+        self._qk_rms = {}
         self._capture_rms = False
         self._step = 0
         self._should_stop = False
@@ -93,6 +94,30 @@ class InstabilityProbe(TrainerCallback):
                         )
 
             self._block_hooks.append(block.register_forward_pre_hook(hook))
+
+            # Scale of the query/key vectors entering the attention logits. This is the
+            # quantity QK-norm is meant to bound: without it nothing stops the q/k
+            # projections from growing, and the logits grow with them. With QK-norm on,
+            # these should stay pinned near the learned gain regardless of how the
+            # projection weights drift.
+            attention = getattr(block, "attn", None)
+            for label, projection in (
+                ("q", getattr(attention, "q_proj", None)),
+                ("k", getattr(attention, "k_proj", None)),
+            ):
+                if projection is None:
+                    continue
+
+                def qk_hook(module, args, output, _index=index, _label=label):
+                    if not self._capture_rms:
+                        return
+                    if isinstance(output, torch.Tensor):
+                        with torch.no_grad():
+                            self._qk_rms[(_index, _label)] = (
+                                output.detach().float().pow(2).mean().sqrt().item()
+                            )
+
+                self._block_hooks.append(projection.register_forward_hook(qk_hook))
 
     # ---- lifecycle -------------------------------------------------------------
 
@@ -285,6 +310,19 @@ class InstabilityProbe(TrainerCallback):
             last = self._block_rms.get(max(self._block_rms))
             if first and last:
                 message += f" (last/first={last / first:.2f})"
+        if self.residual_scale and self._qk_rms:
+            indices = sorted({index for index, _ in self._qk_rms})
+            q_values = " ".join(
+                f"L{index}={self._qk_rms[(index, 'q')]:.3f}"
+                for index in indices
+                if (index, "q") in self._qk_rms
+            )
+            k_values = " ".join(
+                f"L{index}={self._qk_rms[(index, 'k')]:.3f}"
+                for index in indices
+                if (index, "k") in self._qk_rms
+            )
+            message += f" | q_rms {q_values} | k_rms {k_values}"
         LOG.info(message)
 
 

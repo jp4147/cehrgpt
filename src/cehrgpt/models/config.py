@@ -93,6 +93,14 @@ class CEHRGPTConfig(PretrainedConfig):
             `backbone="qwen2"`.
         rope_theta (`float`, *optional*, defaults to 10000.0):
             The base period of the rotary embeddings. Only used when `backbone="qwen2"`.
+        use_qk_norm (`bool`, *optional*, defaults to `False`):
+            Whether to apply RMSNorm to each head's query and key vector before the rotary
+            embedding, as introduced in Qwen3. Qwen2 has nothing bounding the scale of the
+            attention logits, which is a documented source of instability when training
+            from random initialisation; Qwen3 added this "to ensure stable training".
+            Adds two `head_dim`-sized gains per layer, so a checkpoint saved with this
+            enabled cannot be loaded with it disabled and vice versa. Only used when
+            `backbone="qwen2"`.
     """
 
     model_type = "cehrgpt"
@@ -128,6 +136,7 @@ class CEHRGPTConfig(PretrainedConfig):
         rms_norm_eps=1e-6,
         num_key_value_heads=None,
         rope_theta=10000.0,
+        use_qk_norm=False,
         resid_pdrop=0.1,
         embd_pdrop=0.1,
         attn_pdrop=0.1,
@@ -208,6 +217,7 @@ class CEHRGPTConfig(PretrainedConfig):
                 f"num_key_value_heads ({self.num_key_value_heads})"
             )
         self.rope_theta = rope_theta
+        self.use_qk_norm = use_qk_norm
         self.resid_pdrop = resid_pdrop
         self.embd_pdrop = embd_pdrop
         self.attn_pdrop = attn_pdrop

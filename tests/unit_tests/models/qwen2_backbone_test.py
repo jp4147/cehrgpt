@@ -530,6 +530,157 @@ class TestQwen2KVCache(unittest.TestCase):
         )
 
 
+class TestQkNorm(unittest.TestCase):
+    """QK-norm (Qwen3) applied per head over head_dim, before the rotary embedding."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+
+    def test_absent_by_default(self):
+        model = CEHRGPT2Model(build_config("qwen2"))
+        self.assertFalse(model.h[0].attn.use_qk_norm)
+        self.assertFalse(hasattr(model.h[0].attn, "q_norm"))
+        self.assertNotIn("h.0.attn.q_norm.weight", dict(model.named_parameters()))
+
+    def test_present_and_shaped_per_head(self):
+        config = build_config("qwen2", use_qk_norm=True)
+        model = CEHRGPT2Model(config)
+        attention = model.h[0].attn
+        self.assertIsInstance(attention.q_norm, RMSNorm)
+        self.assertIsInstance(attention.k_norm, RMSNorm)
+        head_dim = config.n_embd // config.n_head
+        self.assertEqual(attention.q_norm.weight.shape, (head_dim,))
+        self.assertEqual(attention.k_norm.weight.shape, (head_dim,))
+        # Initialised to unit gain, so the norm starts as a pure rescale.
+        self.assertTrue(torch.allclose(attention.q_norm.weight, torch.ones(head_dim)))
+
+    def test_changes_outputs_and_is_not_a_no_op(self):
+        input_ids = torch.randint(2, VOCAB_SIZE, (1, 10))
+        attention_mask = torch.ones((1, 10), dtype=torch.long)
+        torch.manual_seed(7)
+        without = CEHRGPT2Model(build_config("qwen2")).eval()
+        torch.manual_seed(7)
+        with_norm = CEHRGPT2Model(build_config("qwen2", use_qk_norm=True)).eval()
+        with torch.no_grad():
+            a = without(input_ids, attention_mask=attention_mask).last_hidden_state
+            b = with_norm(input_ids, attention_mask=attention_mask).last_hidden_state
+        self.assertFalse(torch.allclose(a, b, atol=1e-5))
+        self.assertTrue(torch.isfinite(b).all())
+
+    def test_bounds_attention_logit_scale(self):
+        """
+        The point of QK-norm: query/key magnitude no longer scales the logits.
+
+        Inflating the q/k projections by 10x must leave the attention distribution
+        unchanged with QK-norm on, and change it without.
+        """
+        for use_qk_norm, expect_stable in ((True, True), (False, False)):
+            torch.manual_seed(11)
+            model = CEHRGPT2Model(
+                build_config(
+                    "qwen2", use_qk_norm=use_qk_norm, attn_implementation="eager"
+                )
+            ).eval()
+            input_ids = torch.randint(2, VOCAB_SIZE, (1, 9))
+            attention_mask = torch.ones((1, 9), dtype=torch.long)
+            with torch.no_grad():
+                before = model(
+                    input_ids, attention_mask=attention_mask, output_attentions=True
+                ).attentions[0]
+                for block in model.h:
+                    block.attn.q_proj.weight.mul_(10.0)
+                    block.attn.k_proj.weight.mul_(10.0)
+                after = model(
+                    input_ids, attention_mask=attention_mask, output_attentions=True
+                ).attentions[0]
+            stable = torch.allclose(before, after, atol=1e-4)
+            self.assertEqual(
+                stable,
+                expect_stable,
+                f"use_qk_norm={use_qk_norm}: attention scale stability was {stable}",
+            )
+
+    def test_sdpa_matches_eager_with_qk_norm(self):
+        attention_mask = torch.tensor([[1, 1, 1, 1, 0, 1, 1, 1, 1]], dtype=torch.long)
+        input_ids = torch.randint(2, VOCAB_SIZE, (1, 9))
+        torch.manual_seed(5)
+        eager = CEHRGPT2Model(
+            build_config("qwen2", use_qk_norm=True, attn_implementation="eager")
+        ).eval()
+        torch.manual_seed(5)
+        sdpa = CEHRGPT2Model(
+            build_config("qwen2", use_qk_norm=True, attn_implementation="sdpa")
+        ).eval()
+        with torch.no_grad():
+            a = eager(input_ids, attention_mask=attention_mask).last_hidden_state
+            b = sdpa(input_ids, attention_mask=attention_mask).last_hidden_state
+        real = attention_mask.to(torch.bool)
+        torch.testing.assert_close(a[real], b[real], atol=1e-5, rtol=1e-5)
+
+    def test_kv_cache_consistent_with_qk_norm(self):
+        """Cached keys are normalised when written; a later step must not re-normalise."""
+        torch.manual_seed(9)
+        model = CEHRGPT2Model(
+            build_config("qwen2", use_qk_norm=True, attn_implementation="eager")
+        ).eval()
+        seq_len = 6
+        input_ids = torch.randint(2, VOCAB_SIZE, (1, seq_len))
+        attention_mask = torch.ones((1, seq_len), dtype=torch.long)
+        with torch.no_grad():
+            full = model(input_ids, attention_mask=attention_mask).last_hidden_state
+            prefix = model(
+                input_ids[:, :-1],
+                attention_mask=attention_mask[:, :-1],
+                use_cache=True,
+            )
+            step = model(
+                input_ids[:, -1:],
+                attention_mask=attention_mask,
+                past_key_values=prefix.past_key_values,
+                use_cache=True,
+            )
+        torch.testing.assert_close(
+            full[:, -1], step.last_hidden_state[:, -1], atol=1e-5, rtol=1e-5
+        )
+
+    def test_causality_preserved_with_qk_norm(self):
+        model = CEHRGPT2Model(
+            build_config("qwen2", use_qk_norm=True, attn_implementation="sdpa")
+        ).eval()
+        input_ids = torch.randint(2, VOCAB_SIZE, (1, 12))
+        attention_mask = torch.ones((1, 12), dtype=torch.long)
+        with torch.no_grad():
+            baseline = model(
+                input_ids, attention_mask=attention_mask
+            ).last_hidden_state
+            perturbed_ids = input_ids.clone()
+            perturbed_ids[0, -1] = (perturbed_ids[0, -1] + 7) % VOCAB_SIZE
+            perturbed = model(
+                perturbed_ids, attention_mask=attention_mask
+            ).last_hidden_state
+        torch.testing.assert_close(baseline[:, :-1], perturbed[:, :-1])
+
+    def test_gradients_reach_qk_norm_gains(self):
+        model = CEHRGPT2LMHeadModel(
+            build_config("qwen2", use_qk_norm=True)
+        ).train()
+        input_ids = torch.randint(2, VOCAB_SIZE, (2, 10))
+        attention_mask = torch.ones((2, 10), dtype=torch.long)
+        model(
+            input_ids=input_ids, attention_mask=attention_mask, labels=input_ids
+        ).loss.backward()
+        for name in ("cehrgpt.h.0.attn.q_norm.weight", "cehrgpt.h.0.attn.k_norm.weight"):
+            gain = dict(model.named_parameters())[name]
+            self.assertIsNotNone(gain.grad, f"{name} got no gradient")
+            self.assertTrue(torch.isfinite(gain.grad).all())
+            self.assertGreater(gain.grad.abs().sum().item(), 0.0)
+
+    def test_config_round_trips(self):
+        config = build_config("qwen2", use_qk_norm=True)
+        restored = CEHRGPTConfig.from_dict(config.to_dict())
+        self.assertTrue(restored.use_qk_norm)
+
+
 class TestAttnImplementationResolution(unittest.TestCase):
     def test_qwen2_defaults_to_sdpa(self):
         self.assertEqual(resolve_attn_implementation("qwen2"), "sdpa")

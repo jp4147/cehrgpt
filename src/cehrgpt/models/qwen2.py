@@ -166,6 +166,7 @@ class Qwen2Attention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.is_causal = True
+        rms_norm_eps = getattr(config, "rms_norm_eps", 1e-6)
 
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
@@ -197,6 +198,19 @@ class Qwen2Attention(nn.Module):
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.embed_dim, bias=False
         )
+
+        # QK-norm, as introduced in Qwen3. Qwen2 has no normalisation between the q/k
+        # projections and the attention logits, so nothing bounds the scale of those
+        # logits during from-scratch training. Qwen3 normalises each head's query and key
+        # vector over `head_dim` before the rotary embedding, which is what this
+        # reproduces. Note the learned per-dimension gain does mean the rotation no longer
+        # commutes exactly with the normalisation, so relative-offset invariance is
+        # approximate rather than exact - that is a property of the Qwen3 design itself,
+        # not of this port.
+        self.use_qk_norm = getattr(config, "use_qk_norm", False)
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
         self.rotary_emb = Qwen2RotaryEmbedding(
             self.head_dim, base=getattr(config, "rope_theta", 10000.0)
@@ -356,6 +370,13 @@ class Qwen2Attention(nn.Module):
         value = value.view(
             batch_size, seq_length, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
+
+        # QK-norm before the rotary embedding, matching Qwen3. Applied on the last
+        # dimension, which is head_dim either side of the transpose, so normalisation is
+        # per head. Value is deliberately left unnormalised.
+        if self.use_qk_norm:
+            query = self.q_norm(query)
+            key = self.k_norm(key)
 
         # Positions of the *current* query tokens. CEHRGPT2Model supplies sequential
         # positions already offset by the cache length; fall back to a local arange.
