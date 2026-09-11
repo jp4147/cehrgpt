@@ -761,6 +761,23 @@ class CEHRGPT2Model(CEHRGPTPreTrainedModel):
                     attention_mask = attention_mask.masked_fill(
                         ~causal_mask, torch.finfo(self.dtype).min
                     )
+                    # Sample packing zeroes the entire row of every separator position,
+                    # leaving it attending to nothing. SDPA's fused kernels return NaN
+                    # for such rows (the math backend returns a finite average, which is
+                    # why this only shows up on GPU), and that NaN spreads to every
+                    # position in later layers via `0 * NaN` when their column is
+                    # weighted. Let those positions attend to themselves so no row is
+                    # ever empty. Rows that already attend somewhere are unaffected,
+                    # because a position's own diagonal entry is unmasked whenever it is
+                    # a real token. The values produced at separator positions are
+                    # discarded downstream: their labels are -100 and their columns stay
+                    # masked for every other query, so nothing can leak.
+                    query_indices = torch.arange(
+                        query_length, device=attention_mask.device
+                    )
+                    attention_mask[
+                        ..., query_indices, query_indices + (key_length - query_length)
+                    ] = 0.0
 
         # Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head

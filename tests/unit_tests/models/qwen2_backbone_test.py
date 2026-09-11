@@ -314,6 +314,56 @@ class TestQwen2SamplePacking(unittest.TestCase):
     def test_packed_segments_are_isolated_sdpa(self):
         self._assert_segments_isolated("sdpa")
 
+    def test_sdpa_mask_has_no_fully_masked_rows(self):
+        """
+        Every row of the mask handed to SDPA must attend somewhere.
+
+        Sample packing zeroes a separator position's whole row. SDPA's fused kernels
+        return NaN for such rows, and that NaN then spreads to every position in later
+        layers via `0 * NaN` when the separator's column is weighted. The math backend
+        returns a finite average instead, so this is invisible on CPU - hence an
+        invariant test on the mask itself rather than on the output.
+        """
+        captured = {}
+        model = CEHRGPT2Model(
+            build_config("qwen2", attn_implementation="sdpa")
+        ).eval()
+        original_forward = model.h[0].attn.forward
+
+        def capture(hidden_states, position_ids=None, layer_past=None,
+                    attention_mask=None, **kwargs):
+            captured["mask"] = attention_mask
+            return original_forward(
+                hidden_states,
+                position_ids=position_ids,
+                layer_past=layer_past,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+
+        model.h[0].attn.forward = capture
+
+        attention_mask = torch.tensor([[1, 1, 1, 1, 0, 1, 1, 1, 1]], dtype=torch.long)
+        input_ids = torch.randint(2, VOCAB_SIZE, (1, 9))
+        input_ids[0, 4] = 0
+        with torch.no_grad():
+            output = model(input_ids, attention_mask=attention_mask)
+
+        mask = captured["mask"]
+        self.assertIsNotNone(mask, "attention mask was not passed to the attention")
+        self.assertEqual(mask.dim(), 4)
+        floor = torch.finfo(mask.dtype).min
+        attends_somewhere = (mask > floor).any(dim=-1)
+        self.assertTrue(
+            attends_somewhere.all(),
+            f"fully masked rows at {(~attends_somewhere).nonzero().tolist()}",
+        )
+        # The separator must attend only to itself, so nothing can leak into it.
+        separator_row = mask[0, 0, 4]
+        self.assertEqual(int((separator_row > floor).sum()), 1)
+        self.assertGreater(separator_row[4], floor)
+        self.assertTrue(torch.isfinite(output.last_hidden_state).all())
+
     def test_packing_mask_is_block_diagonal(self):
         mask = create_sample_packing_attention_mask(
             torch.tensor([[1, 1, 0, 1, 1, 1]])
