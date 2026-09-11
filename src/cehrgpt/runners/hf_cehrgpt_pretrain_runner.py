@@ -45,6 +45,7 @@ from cehrgpt.runners.gpt_runner_util import (
 )
 from cehrgpt.runners.hf_gpt_runner_argument_dataclass import CehrGPTArguments
 from cehrgpt.runners.sample_packing_trainer import SamplePackingTrainer
+from cehrgpt.tools.instability_probe import InstabilityProbe
 
 LOG = logging.get_logger("transformers")
 
@@ -568,6 +569,10 @@ def main():
                 model_args.early_stopping_patience,
                 cehrgpt_args.early_stopping_threshold,
             )
+        )
+    if cehrgpt_args.instability_probe:
+        callbacks.append(
+            InstabilityProbe(every=cehrgpt_args.instability_probe_every)
         )
 
     if cehrgpt_args.sample_packing:

@@ -43,6 +43,19 @@ class CehrGPTArguments:
         default=1e-6,
         metadata={"help": "Epsilon for the RMSNorm layers; only used by the qwen2 backbone"},
     )
+    instability_probe: Optional[bool] = dataclasses.field(
+        default=False,
+        metadata={
+            "help": "Attach InstabilityProbe, which logs gradient norms (total and "
+            "per decoder layer), max |logit|, embedding norm and final-norm weight norm, "
+            "and stops the run on the first non-finite gradient. Diagnostic only; it "
+            "reads gradients and does not modify training."
+        },
+    )
+    instability_probe_every: Optional[int] = dataclasses.field(
+        default=25,
+        metadata={"help": "Step interval for InstabilityProbe logging"},
+    )
     resid_pdrop: Optional[float] = dataclasses.field(
         default=0.1,
         metadata={
