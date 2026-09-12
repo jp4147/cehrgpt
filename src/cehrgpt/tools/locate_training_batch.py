@@ -23,10 +23,18 @@ Fidelity notes - the batch order depends on all of these, so they must match the
     given step differs per rank. Pass `--num_replicas`/`--rank` to match a multi-GPU run;
     the defaults assume a single process.
 
+The prepared-dataset cache is named `<data_folder basename>_<md5>`, where the hash covers
+data_folder, tokenizer_name_or_path, validation_split_percentage, test_eval_ratio,
+split_by_patient and chronological_split. Editing any of those in the YAML after a run
+makes that run's cache unreachable by recomputation, so `--dataset_path` can point at it
+directly. The runner loads the `<basename>_<hash>` directory as a DatasetDict and uses its
+`train` split; this tool accepts either that directory or its `train/` subdirectory.
+
 Usage:
     python -m cehrgpt.tools.locate_training_batch \
         --yaml_file /path/to/comet_s_qwen2.yaml \
-        --learning_rate 0.00019925420155579422
+        --learning_rate 0.00019925420155579422 \
+        --dataset_path /mnt/ssd1/.../train_4f96e9a851c44706919ddde8333c98f7
 """
 
 import argparse
@@ -56,32 +64,91 @@ def parse_config(yaml_file: str):
     return parser.parse_yaml_file(yaml_file=os.path.expanduser(yaml_file))
 
 
-def load_processed_dataset(cehrgpt_args, data_args, model_args) -> DatasetDict:
-    """Mirror the runner's dataset resolution, including the post-load filter."""
-    if cehrgpt_args.tokenized_dataset_name:
-        prepared_ds_path = Path(
-            os.path.join(
-                data_args.dataset_prepared_path, cehrgpt_args.tokenized_dataset_name
+def _describe_cache_candidates(dataset_prepared_path: str) -> str:
+    """List the cache directories that do exist, to make a hash mismatch diagnosable."""
+    root = Path(os.path.expanduser(dataset_prepared_path))
+    if not root.exists():
+        return f"  (dataset_prepared_path does not exist: {root})"
+    candidates = sorted(p for p in root.iterdir() if p.is_dir())
+    if not candidates:
+        return f"  (no cache directories under {root})"
+    lines = [f"  Available caches under {root}:"]
+    for candidate in candidates:
+        shape = (
+            "DatasetDict"
+            if (candidate / "dataset_dict.json").exists()
+            else "Dataset" if (candidate / "dataset_info.json").exists() else "unknown"
+        )
+        lines.append(f"    {candidate.name}  [{shape}]")
+    return "\n".join(lines)
+
+
+def _as_train_split(loaded, source: str):
+    """
+    Normalise whatever `load_from_disk` returned into the train split.
+
+    The runner loads the parent directory, which is DatasetDict-shaped
+    (`dataset_dict.json` plus `train/` and `validation/` subdirectories), and then uses
+    `processed_dataset["train"]`. Pointing directly at the `train/` subdirectory yields a
+    bare `Dataset` instead, which is equally usable here because this tool only needs the
+    train split - the sample-packing batch order is built from
+    `processed_dataset["train"]["num_of_concepts"]` alone.
+    """
+    if isinstance(loaded, (DatasetDict, dict)):
+        if "train" not in loaded:
+            raise RuntimeError(
+                f"{source} is DatasetDict-shaped but has no 'train' split; found "
+                f"{sorted(loaded.keys())}."
             )
-        )
-    else:
-        prepared_ds_path = generate_prepared_ds_path(data_args, model_args)
+        print(f"  loaded DatasetDict with splits {sorted(loaded.keys())}; using ['train']")
+        return loaded["train"]
+    print(f"  loaded a single Dataset; treating it as the train split")
+    return loaded
 
-    if os.path.exists(os.path.join(data_args.data_folder, "dataset_dict.json")):
-        print(f"Loading dataset from data_folder: {data_args.data_folder}")
-        dataset = load_from_disk(os.path.expanduser(data_args.data_folder))
-    elif any(prepared_ds_path.glob("*")):
-        print(f"Loading prepared dataset: {prepared_ds_path}")
-        dataset = load_from_disk(str(prepared_ds_path))
-    else:
-        raise RuntimeError(
-            "No prepared dataset found. Looked in data_folder "
-            f"({data_args.data_folder}) and prepared path ({prepared_ds_path}). "
-            "Run the pretrain runner first so the tokenized dataset exists; this script "
-            "deliberately does not re-tokenize, so that it cannot diverge from the run."
-        )
 
-    before = {key: len(dataset[key]) for key in dataset}
+def load_train_split(cehrgpt_args, data_args, model_args, dataset_path: Optional[str]):
+    """Mirror the runner's dataset resolution, including the post-load filter."""
+    if dataset_path:
+        resolved = Path(os.path.expanduser(dataset_path))
+        if not resolved.exists():
+            raise RuntimeError(f"--dataset_path does not exist: {resolved}")
+        print(f"Loading dataset from --dataset_path: {resolved}")
+        dataset = _as_train_split(load_from_disk(str(resolved)), str(resolved))
+    else:
+        if cehrgpt_args.tokenized_dataset_name:
+            prepared_ds_path = Path(
+                os.path.join(
+                    data_args.dataset_prepared_path, cehrgpt_args.tokenized_dataset_name
+                )
+            )
+        else:
+            prepared_ds_path = generate_prepared_ds_path(data_args, model_args)
+
+        if os.path.exists(os.path.join(data_args.data_folder, "dataset_dict.json")):
+            print(f"Loading dataset from data_folder: {data_args.data_folder}")
+            dataset = _as_train_split(
+                load_from_disk(os.path.expanduser(data_args.data_folder)),
+                data_args.data_folder,
+            )
+        elif any(prepared_ds_path.glob("*")):
+            print(f"Loading prepared dataset: {prepared_ds_path}")
+            dataset = _as_train_split(
+                load_from_disk(str(prepared_ds_path)), str(prepared_ds_path)
+            )
+        else:
+            raise RuntimeError(
+                "No prepared dataset found.\n"
+                f"  data_folder     : {data_args.data_folder}\n"
+                f"  computed cache  : {prepared_ds_path}\n"
+                "The cache name is a hash of data_folder, tokenizer_name_or_path, "
+                "validation_split_percentage, test_eval_ratio, split_by_patient and "
+                "chronological_split, so editing any of those in the YAML after a run "
+                "makes the old cache unreachable by recomputation.\n"
+                f"{_describe_cache_candidates(data_args.dataset_prepared_path)}\n"
+                "  Pass --dataset_path <cache dir> to use one directly."
+            )
+
+    before = len(dataset)
 
     # Same filter the runner applies before handing the dataset to the trainer.
     def filter_func(examples):
@@ -95,15 +162,13 @@ def load_processed_dataset(cehrgpt_args, data_args, model_args) -> DatasetDict:
     filter_args = {"batched": True, "batch_size": data_args.preprocessing_batch_size}
     if not data_args.streaming:
         filter_args["num_proc"] = data_args.preprocessing_num_workers
-    for key in dataset.keys():
-        dataset[key] = dataset[key].filter(filter_func, **filter_args)
+    dataset = dataset.filter(filter_func, **filter_args)
 
-    after = {key: len(dataset[key]) for key in dataset}
-    for key in before:
-        print(
-            f"  split={key}: {before[key]} -> {after[key]} rows after the "
-            f"min_num_tokens={data_args.min_num_tokens} filter"
-        )
+    print(
+        f"  train rows: {before} -> {len(dataset)} after the "
+        f"min_num_tokens={data_args.min_num_tokens}"
+        f"{', drop_long_sequences' if cehrgpt_args.drop_long_sequences else ''} filter"
+    )
     return dataset
 
 
@@ -175,6 +240,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--yaml_file", required=True)
     parser.add_argument(
+        "--dataset_path",
+        default=None,
+        help="Load this prepared-dataset directory instead of recomputing the cache hash "
+        "from the YAML. Accepts the DatasetDict parent (the <basename>_<hash> directory, "
+        "which is what the runner loads) or its train/ subdirectory. Needed when the YAML "
+        "has been edited since the run, because the hash would no longer match.",
+    )
+    parser.add_argument(
         "--global_step",
         type=int,
         default=None,
@@ -216,8 +289,9 @@ def main() -> int:
             "SamplePackingBatchSampler. The batch order below will not match."
         )
 
-    dataset = load_processed_dataset(cehrgpt_args, data_args, model_args)
-    train_dataset = dataset["train"]
+    train_dataset = load_train_split(
+        cehrgpt_args, data_args, model_args, args.dataset_path
+    )
     lengths = train_dataset["num_of_concepts"]
 
     # Exactly the sampler SamplePackingTrainer.get_train_dataloader builds.
