@@ -419,6 +419,34 @@ class GPT2FlashAttention(GPT2Attention):
 
 
 class LlamaMLP(nn.Module):
+
+    # def __init__(self, intermediate_size, config):
+    #     super().__init__()
+    #     self.config = config
+    #     self.hidden_size = config.hidden_size
+    #     self.intermediate_size = intermediate_size
+    #     self.gate_proj = nn.Linear(
+    #         self.hidden_size, self.intermediate_size, bias=config.mlp_bias
+    #     )
+    #     self.up_proj = nn.Linear(
+    #         self.hidden_size, self.intermediate_size, bias=config.mlp_bias
+    #     )
+    #     self.down_proj = nn.Linear(
+    #         self.intermediate_size, self.hidden_size, bias=config.mlp_bias
+    #     )
+    #     self.act_fn = ACT2FN[config.activation_function]
+    #     # Matches GPT2MLP: residual dropout on the MLP output. Without this the MLP
+    #     # branch is unregularised while the attention branch still gets resid_pdrop,
+    #     # so `resid_pdrop` would mean different things depending on decoder_mlp.
+    #     self.dropout = nn.Dropout(config.resid_pdrop)
+
+    # def forward(self, x: Optional[Tuple[torch.FloatTensor]]) -> torch.FloatTensor:
+    #     down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    #     down_proj = self.dropout(down_proj)
+    #     return down_proj
+
+    _step_counter = 0  # <-- new: class-level counter for debug logging
+
     def __init__(self, intermediate_size, config):
         super().__init__()
         self.config = config
@@ -440,7 +468,24 @@ class LlamaMLP(nn.Module):
         self.dropout = nn.Dropout(config.resid_pdrop)
 
     def forward(self, x: Optional[Tuple[torch.FloatTensor]]) -> torch.FloatTensor:
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = self.gate_proj(x)
+        act = self.act_fn(gate)
+        up = self.up_proj(x)
+        gated = act * up
+
+        LlamaMLP._step_counter += 1
+        if LlamaMLP._step_counter % 20 == 0:
+            with torch.no_grad():
+                print(
+                    f"[LlamaMLP-debug] call={LlamaMLP._step_counter} "
+                    f"gate_abs_max={gate.abs().max().item():.2f} "
+                    f"up_abs_max={up.abs().max().item():.2f} "
+                    f"gated_abs_max={gated.abs().max().item():.2f} "
+                    f"frac_gate_gt10={(gate.abs() > 10).float().mean().item():.4f}",
+                    flush=True,
+                )
+
+        down_proj = self.down_proj(gated)
         down_proj = self.dropout(down_proj)
         return down_proj
 
